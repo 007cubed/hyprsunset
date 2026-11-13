@@ -33,6 +33,7 @@ void CConfigManager::init() {
     m_config.addSpecialConfigValue("profile", "gamma", Hyprlang::FLOAT{1.0f});
     m_config.addSpecialConfigValue("profile", "identity", Hyprlang::INT{0});
     m_config.addSpecialConfigValue("profile", "on-switch", Hyprlang::STRING{""});
+    m_config.addSpecialConfigValue("profile", "transition", Hyprlang::INT{0});
 
     m_config.commence();
 
@@ -89,6 +90,7 @@ std::vector<SSunsetProfile> CConfigManager::getSunsetProfiles() {
         float         gamma;
         bool          identity;
         std::string   onSwitch;
+        Hyprlang::INT transition = 0;
 
         try {
             time        = std::any_cast<Hyprlang::STRING>(m_config.getSpecialConfigValue("profile", "time", key.c_str()));
@@ -96,6 +98,7 @@ std::vector<SSunsetProfile> CConfigManager::getSunsetProfiles() {
             gamma       = std::any_cast<Hyprlang::FLOAT>(m_config.getSpecialConfigValue("profile", "gamma", key.c_str()));
             identity    = std::any_cast<Hyprlang::INT>(m_config.getSpecialConfigValue("profile", "identity", key.c_str()));
             onSwitch    = std::any_cast<Hyprlang::STRING>(m_config.getSpecialConfigValue("profile", "on-switch", key.c_str()));
+            transition  = std::any_cast<Hyprlang::INT>(m_config.getSpecialConfigValue("profile", "transition", key.c_str()));
         } catch (const std::bad_any_cast& e) {
             RASSERT(false, "Failed to construct Profile: {}", e.what()); //
         } catch (const std::out_of_range& e) {
@@ -141,6 +144,11 @@ std::vector<SSunsetProfile> CConfigManager::getSunsetProfiles() {
             }
         }
 
+        if (transition < 0) {
+            Debug::log(ERR, "Invalid transition: {} minutes, using 0 for profile {}", transition, key);
+            transition = 0;
+        }
+
         // clang-format off
         result.push_back(SSunsetProfile{
             .time = {
@@ -150,7 +158,8 @@ std::vector<SSunsetProfile> CConfigManager::getSunsetProfiles() {
             .temperature = temperature,
             .gamma       = gamma,
             .identity    = identity,
-            .onSwitch = onSwitch,
+            .onSwitch    = onSwitch,
+            .transition  = std::chrono::minutes(transition),
         });
         // clang-format on
     }

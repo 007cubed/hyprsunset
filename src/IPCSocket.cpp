@@ -233,6 +233,7 @@ bool CIPCSocket::mainThreadParseRequest() {
         }
 
         g_pHyprsunset->GAMMA = gamma / 100;
+        g_pHyprsunset->pauseTransition();
         return true;
     }
 
@@ -265,6 +266,7 @@ bool CIPCSocket::mainThreadParseRequest() {
 
         g_pHyprsunset->KELVIN   = kelvin;
         g_pHyprsunset->identity = false;
+        g_pHyprsunset->pauseTransition();
         return true;
     }
 
@@ -272,6 +274,7 @@ bool CIPCSocket::mainThreadParseRequest() {
         int spaceSeparator = copy.find_first_of(' ');
         if (spaceSeparator == -1) {
             g_pHyprsunset->identity = true;
+            g_pHyprsunset->pauseTransition();
             return true;
         }
 
@@ -281,9 +284,11 @@ bool CIPCSocket::mainThreadParseRequest() {
             return false;
         } else if (args == "true") {
             g_pHyprsunset->identity = true;
+            g_pHyprsunset->pauseTransition();
             return true;
         } else if (args == "false") {
             g_pHyprsunset->identity = false;
+            g_pHyprsunset->pauseTransition();
             return true;
         } else {
             m_szReply = "Invalid identity value (should be true or false)";
@@ -306,12 +311,15 @@ bool CIPCSocket::mainThreadParseRequest() {
 
             if (args == "temperature") {
                 g_pHyprsunset->KELVIN = profile.temperature;
+                g_pHyprsunset->resumeTransition();
                 return true;
             } else if (args == "gamma") {
                 g_pHyprsunset->GAMMA = profile.gamma;
+                g_pHyprsunset->resumeTransition();
                 return true;
             } else if (args == "identity") {
                 g_pHyprsunset->identity = profile.identity;
+                g_pHyprsunset->resumeTransition();
                 return true;
             } else {
                 m_szReply = "Invalid reset value (should be either temperature, gamma or identity)";
@@ -332,10 +340,11 @@ bool CIPCSocket::mainThreadParseRequest() {
             float       gamma    = profile.gamma;
             bool        ident    = profile.identity;
             std::string onSwitch = profile.onSwitch;
+            auto        trans    = profile.transition.count();
 
             g_pHyprsunset->scheduleOnSwitch();
 
-            m_szReply = std::format("Time: {:0>2}:{:0>2}\nTemperature: {}\nGamma: {}\nIdentity: {}\nOn-Switch: {}", hrs, mins, temp, gamma, ident, onSwitch);
+            m_szReply = std::format("Time: {:0>2}:{:0>2}\nTemperature: {}\nGamma: {}\nIdentity: {}\nOn-Switch: {}\nTransition: {}", hrs, mins, temp, gamma, ident, onSwitch, trans);
             return true;
         }
         m_szReply = "No profile is currently loaded";

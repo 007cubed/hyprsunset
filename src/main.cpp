@@ -113,6 +113,10 @@ int main(int argc, char** argv, char** envp) {
     if (identity)
         g_pHyprsunset->identity = true;
 
+    // Values from the command line hold until the next profile.
+    if (kelvin != -1 || gamma != -1 || identity)
+        g_pHyprsunset->pauseTransition();
+
     if (g_pHyprsunset->ONSWITCH != "")
         g_pHyprsunset->scheduleOnSwitch();
 
