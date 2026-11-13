@@ -344,7 +344,10 @@ bool CIPCSocket::mainThreadParseRequest() {
 
             g_pHyprsunset->scheduleOnSwitch();
 
-            m_szReply = std::format("Time: {:0>2}:{:0>2}\nTemperature: {}\nGamma: {}\nIdentity: {}\nOn-Switch: {}\nTransition: {}", hrs, mins, temp, gamma, ident, onSwitch, trans);
+            const auto sun = profile.sunEvent == NSun::EVENT_NONE ? std::string{} : std::format(" ({}{:+})", NSun::eventName(profile.sunEvent), profile.sunOffset.count());
+
+            m_szReply =
+                std::format("Time: {:0>2}:{:0>2}{}\nTemperature: {}\nGamma: {}\nIdentity: {}\nOn-Switch: {}\nTransition: {}", hrs, mins, sun, temp, gamma, ident, onSwitch, trans);
             return true;
         }
         m_szReply = "No profile is currently loaded";

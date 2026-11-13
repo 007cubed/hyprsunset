@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <tuple>
 #include <chrono>
 #include <sys/eventfd.h>
 #include <sys/poll.h>
@@ -426,19 +427,67 @@ void CHyprsunset::onSwitch() {
 }
 
 void CHyprsunset::loadCurrentProfile() {
-    profiles  = g_pConfigManager->getSunsetProfiles();
-    MAX_GAMMA = g_pConfigManager->getMaxGamma();
+    m_configProfiles = g_pConfigManager->getSunsetProfiles();
+    m_location       = g_pConfigManager->getLocation();
+    MAX_GAMMA        = g_pConfigManager->getMaxGamma();
 
-    Debug::log(NONE, "┣ Loaded {} profiles", profiles.size());
+    Debug::log(NONE, "┣ Loaded {} profiles", m_configProfiles.size());
 
-    std::sort(profiles.begin(), profiles.end(), [](const auto& a, const auto& b) {
-        if (a.time.hour < b.time.hour)
-            return true;
-        else if (a.time.hour > b.time.hour)
-            return false;
-        else
-            return a.time.minute < b.time.minute;
-    });
+    if (followsSun() && !m_location)
+        Debug::log(ERR, "Profiles follow the sun but latitude and longitude are not set, skipping them");
+
+    resolveProfiles(std::chrono::floor<std::chrono::days>(localNow()));
+
+    const int current = currentProfile(localNow());
+
+    if (current == -1)
+        return;
+
+    const auto& profile = profiles[current];
+    applyProfile(profile);
+    resumeTransition();
+
+    Debug::log(NONE, "┣ Applying profile from: {}:{}", profile.time.hour.count(), profile.time.minute.count());
+}
+
+bool CHyprsunset::followsSun() const {
+    return std::ranges::any_of(m_configProfiles, [](const auto& p) { return p.sunEvent != NSun::EVENT_NONE; });
+}
+
+// Builds the day's profiles: sun times are resolved for that day, profiles whose sun event does not
+// happen (polar day or night) are left out, and the result is sorted by time.
+void CHyprsunset::resolveProfiles(std::chrono::local_days day) {
+    m_resolvedDay = day;
+    profiles.clear();
+    profiles.reserve(m_configProfiles.size());
+
+    for (auto profile : m_configProfiles) {
+        if (profile.sunEvent != NSun::EVENT_NONE) {
+            if (!m_location)
+                continue;
+
+            // The calendar date of the local day, as the solar maths works on dates.
+            const auto event = NSun::eventTime(profile.sunEvent, std::chrono::sys_days{day.time_since_epoch()}, *m_location);
+            if (!event) {
+                Debug::log(WARN, "No {} today at this latitude, skipping that profile", NSun::eventName(profile.sunEvent));
+                continue;
+            }
+
+            // Wrap into the day, so a large offset still gives a valid time of day.
+            const auto local  = std::chrono::floor<std::chrono::minutes>(toLocal(*event + profile.sunOffset));
+            auto       minute = (local - day) % std::chrono::days(1);
+            if (minute < std::chrono::minutes::zero())
+                minute += std::chrono::days(1);
+
+            profile.time = {.hour = std::chrono::floor<std::chrono::hours>(minute), .minute = minute % std::chrono::hours(1)};
+            Debug::log(LOG, "{}{:+} today at {:0>2}:{:0>2}", NSun::eventName(profile.sunEvent), profile.sunOffset.count(), profile.time.hour.count(), profile.time.minute.count());
+        }
+
+        profiles.push_back(profile);
+    }
+
+    // Config order breaks ties, so equal times sort the same way every time.
+    std::ranges::sort(profiles, [](const auto& a, const auto& b) { return std::tuple{a.time.hour, a.time.minute, a.id} < std::tuple{b.time.hour, b.time.minute, b.id}; });
 
     // A transition has to finish before the next profile starts.
     for (size_t i = 0; i < profiles.size(); ++i) {
@@ -454,17 +503,6 @@ void CHyprsunset::loadCurrentProfile() {
             profile.transition = gap;
         }
     }
-
-    const int current = currentProfile(localNow());
-
-    if (current == -1)
-        return;
-
-    const auto& profile = profiles[current];
-    applyProfile(profile);
-    resumeTransition();
-
-    Debug::log(NONE, "┣ Applying profile from: {}:{}", profile.time.hour.count(), profile.time.minute.count());
 }
 
 void CHyprsunset::resumeTransition() {
@@ -579,36 +617,63 @@ static bool waitUntilRealtime(int stopFd, const std::atomic<bool>& terminate, ti
 
 void CHyprsunset::schedule() {
     m_scheduleThread = std::thread([this] {
-        // profiles is rebuilt by an IPC reset on the main thread, so it is only read under loopRequestMutex.
-        int last = -1;
+        // profiles is rebuilt by an IPC reset and for each new day, so it is only touched under loopRequestMutex.
+        // The day's order can change, so the current profile is tracked by id.
+        std::optional<size_t> last;
         {
             std::lock_guard<std::mutex> lg(m_sEventLoopInternals.loopRequestMutex);
-            last = currentProfile(localNow());
+            if (const int current = currentProfile(localNow()); current != -1)
+                last = profiles[current].id;
         }
 
         while (!m_bTerminate.load()) {
+            // A profile wake applies the profile and runs on-switch, even if it is the same profile.
+            // A midnight wake only resolves the new day's sun times: under them, a profile that
+            // started before midnight can look as if it had not started yet.
+            enum eWake : uint8_t {
+                WAKE_STEP,
+                WAKE_PROFILE,
+                WAKE_MIDNIGHT,
+            };
+
             SysTime wake;
-            // A wake at a profile's time applies it and runs on-switch, even if it is the same profile.
-            bool forProfile = false;
+            eWake   kind = WAKE_STEP;
             {
                 std::lock_guard<std::mutex> lg(m_sEventLoopInternals.loopRequestMutex);
-                const auto                  now     = std::chrono::system_clock::now();
-                const int                   current = currentProfile(toLocal(now));
-                if (current == -1)
+                const auto                  now      = std::chrono::system_clock::now();
+                const auto                  localNow = toLocal(now);
+                const auto                  today    = std::chrono::floor<std::chrono::days>(localNow);
+                const bool                  sun      = followsSun();
+                if (sun && today != m_resolvedDay)
+                    resolveProfiles(today);
+
+                // Without sun profiles the list never empties, so there is nothing left to schedule.
+                const int current = currentProfile(localNow);
+                if (current == -1 && !sun)
                     break;
 
                 // Wake for the next transition step, or else for the next profile. Steps keep
                 // waking while a manual change pauses the transition, so a reset can resume it.
-                if (const auto step = transitionAt(profiles, current, now); step)
-                    wake = step->nextStep;
-                else {
-                    const auto& next     = profiles[(current + 1) % profiles.size()];
-                    const auto  localNow = toLocal(now);
-                    LocalTime   local    = std::chrono::floor<std::chrono::days>(localNow) + next.time.hour + next.time.minute;
-                    if (localNow >= local)
-                        local += std::chrono::days(1);
-                    wake       = toSys(local, now);
-                    forProfile = true;
+                if (current != -1) {
+                    if (const auto step = transitionAt(profiles, current, now); step)
+                        wake = step->nextStep;
+                    else {
+                        const auto& next  = profiles[(current + 1) % profiles.size()];
+                        LocalTime   local = today + next.time.hour + next.time.minute;
+                        if (localNow >= local)
+                            local += std::chrono::days(1);
+                        wake = toSys(local, now);
+                        kind = WAKE_PROFILE;
+                    }
+                }
+
+                // Sun times move every day, so also wake at midnight to resolve the new day's.
+                if (sun) {
+                    const auto midnight = toSys(today + std::chrono::days(1), now);
+                    if (current == -1 || midnight < wake) {
+                        wake = midnight;
+                        kind = WAKE_MIDNIGHT;
+                    }
                 }
             }
 
@@ -622,25 +687,33 @@ void CHyprsunset::schedule() {
             if (m_bTerminate.load())
                 break;
 
-            const auto now        = std::chrono::system_clock::now();
-            const int  newcurrent = currentProfile(toLocal(now));
-            if (newcurrent == -1)
-                break;
+            // The loop top resolves the new day and schedules from there.
+            if (kind == WAKE_MIDNIGHT)
+                continue;
 
-            const bool switched = forProfile || newcurrent != last;
+            const auto now      = std::chrono::system_clock::now();
+            const auto localNow = toLocal(now);
+            if (const auto today = std::chrono::floor<std::chrono::days>(localNow); followsSun() && today != m_resolvedDay)
+                resolveProfiles(today);
+
+            const int newcurrent = currentProfile(localNow);
+            if (newcurrent == -1)
+                continue;
+
+            const auto& newProfile = profiles[newcurrent];
+            const bool  switched   = kind == WAKE_PROFILE || newProfile.id != last;
 
             // A manual change holds until the next profile.
             if (!switched && m_transitionPaused)
                 continue;
 
             if (switched) {
-                const auto& newProfile = profiles[newcurrent];
-                last                   = newcurrent;
+                last = newProfile.id;
                 applyProfile(newProfile);
                 m_transitionPaused                = false;
                 m_sEventLoopInternals.runOnSwitch = true;
                 Debug::log(NONE, "┣ Switched to new profile from: {}:{}{}", newProfile.time.hour.count(), newProfile.time.minute.count(),
-                           newProfile.transition.count() > 0 ? std::format(", fading in over {} minutes", newProfile.transition.count()) : "");
+                           newProfile.transition.count() > 0 ? std::format(", fading in over {} min", newProfile.transition.count()) : "");
             }
 
             const auto step = transitionAt(profiles, newcurrent, now);

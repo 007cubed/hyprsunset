@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include "protocols/hyprland-ctm-control-v1.hpp"
 #include "protocols/wayland.hpp"
+#include "helpers/Sun.hpp"
 
 #include <hyprutils/math/Mat3x3.hpp>
 #include <hyprutils/memory/WeakPtr.hpp>
@@ -50,6 +51,11 @@ struct SSunsetProfile {
     std::string   onSwitch    = "";
     // Fade in from the previous profile over this long, starting at time.
     std::chrono::minutes transition{0};
+    // Set when time follows the sun; time then holds the resolved time for the current day.
+    NSun::eEvent         sunEvent = NSun::EVENT_NONE;
+    std::chrono::minutes sunOffset{0};
+    // Position in the config. Stays the same when the day's order changes.
+    size_t id = 0;
 };
 
 // A profile transition in progress. The CTM blends from `from` to the current profile's matrix.
@@ -109,14 +115,20 @@ class CHyprsunset {
     void        onSwitch();
     int         currentProfile(LocalTime now);
     void        applyProfile(const SSunsetProfile& profile);
+    void        resolveProfiles(std::chrono::local_days day);
+    bool        followsSun() const;
     void        startEventLoop();
     // Join workers before dropping the CTM manager or returning from main.
     // Otherwise a detached thread calls current_zone() or reload() while
     // those objects are being destroyed.
-    void                        shutdownWorkers();
+    void        shutdownWorkers();
 
-    std::thread                 m_scheduleThread;
-    std::vector<SSunsetProfile> profiles;
+    std::thread m_scheduleThread;
+    // The profiles in effect for m_resolvedDay, sorted by time. Built from m_configProfiles.
+    std::vector<SSunsetProfile>    profiles;
+    std::vector<SSunsetProfile>    m_configProfiles;
+    std::optional<NSun::SLocation> m_location;
+    std::chrono::local_days        m_resolvedDay;
 };
 
 // Cleared at the start of ~CHyprsunset. See g_ipcSocketAlive.
