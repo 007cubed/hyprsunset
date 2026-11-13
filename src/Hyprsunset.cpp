@@ -517,6 +517,31 @@ std::optional<SSunsetProfile> CHyprsunset::getCurrentProfile() {
     return profiles[current];
 }
 
+static std::string profileJson(const SSunsetProfile& profile) {
+    const auto sun = profile.sunEvent == NSun::EVENT_NONE ? std::string{} : std::format("{}{:+}", NSun::eventName(profile.sunEvent), profile.sunOffset.count());
+    return std::format(R"({{"time":"{:0>2}:{:0>2}","sun":"{}","temperature":{},"identity":{},"gamma":{:.0f},"transition":{}}})", profile.time.hour.count(),
+                       profile.time.minute.count(), sun, profile.temperature, profile.identity, profile.gamma * 100, profile.transition.count());
+}
+
+std::string CHyprsunset::statusJson() {
+    const auto  now     = std::chrono::system_clock::now();
+    const int   current = currentProfile(toLocal(now));
+    std::string profile = "null", next = "null", fade = "null";
+
+    if (current != -1) {
+        profile = profileJson(profiles[current]);
+        next    = profileJson(profiles[(current + 1) % profiles.size()]);
+
+        if (m_transition) {
+            const auto end = std::chrono::floor<std::chrono::minutes>(toLocal(profileStart(profiles[current], now) + profiles[current].transition));
+            fade           = std::format(R"({{"progress":{:.2f},"end":"{:%H:%M}"}})", m_transition->progress, end);
+        }
+    }
+
+    return std::format(R"({{"temperature":{},"identity":{},"gamma":{:.0f},"paused":{},"fade":{},"profile":{},"next":{}}})", KELVIN, identity, GAMMA * 100, m_transitionPaused, fade,
+                       profile, next);
+}
+
 // Relative sleeps pause during suspend. An absolute CLOCK_REALTIME timer is
 // already expired when the machine wakes after the deadline. The stop fd is
 // polled with it so shutdown does not wait out that deadline.

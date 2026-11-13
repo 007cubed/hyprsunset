@@ -330,6 +330,12 @@ bool CIPCSocket::mainThreadParseRequest() {
         return false;
     }
 
+    // Before "profile": unlike it, this runs no on-switch command, so it is safe to poll.
+    if (copy == "status") {
+        m_szReply = g_pHyprsunset->statusJson();
+        return false;
+    }
+
     if (copy.find("profile") == 0) {
         if (auto profileOpt = g_pHyprsunset->getCurrentProfile()) {
             auto        profile = profileOpt.value();

@@ -85,10 +85,12 @@ class CHyprsunset {
     void                          tick();
     void                          loadCurrentProfile();
     std::optional<SSunsetProfile> getCurrentProfile();
-    void                          scheduleOnSwitch();
-    void                          pauseTransition();
-    void                          resumeTransition();
-    void                          terminate();
+    // Read-only JSON for status bars: the applied values, a running fade and the next profile.
+    std::string statusJson();
+    void        scheduleOnSwitch();
+    void        pauseTransition();
+    void        resumeTransition();
+    void        terminate();
     // Async-signal-safe. Wakes the schedule and IPC threads blocked in poll.
     void signalStop();
 
