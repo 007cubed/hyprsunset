@@ -66,6 +66,92 @@ static Mat3x3 matrixForKelvin(unsigned long long temp) {
     return std::array<float, 9>{r / 255.F, 0, 0, 0, g / 255.F, 0, 0, 0, b / 255.F};
 }
 
+static Mat3x3 matrixFor(unsigned long long kelvin, float gamma, bool identity) {
+    Mat3x3 ctm = identity ? Mat3x3::identity() : matrixForKelvin(kelvin);
+    ctm.multiply(std::array<float, 9>{gamma, 0, 0, 0, gamma, 0, 0, 0, gamma});
+    return ctm;
+}
+
+static Mat3x3 matrixFor(const SSunsetProfile& profile) {
+    return matrixFor(profile.temperature, profile.gamma, profile.identity);
+}
+
+// Linear in the channel gains, so every step changes the screen by the same amount.
+static Mat3x3 blend(const Mat3x3& from, const Mat3x3& to, float progress) {
+    auto       result = from.getMatrix();
+    const auto target = to.getMatrix();
+
+    for (size_t i = 0; i < result.size(); ++i)
+        result[i] += (target[i] - result[i]) * progress;
+
+    return result;
+}
+
+// One step per 8-bit level of the channel that changes most, and at most one per second.
+static long long transitionSteps(const Mat3x3& from, const Mat3x3& to, std::chrono::seconds duration) {
+    const auto a = from.getMatrix(), b = to.getMatrix();
+    float      maxDelta = 0.F;
+
+    for (size_t i = 0; i < a.size(); ++i)
+        maxDelta = std::max(maxDelta, std::abs(b[i] - a[i]));
+
+    return std::clamp<long long>(std::ceil(maxDelta * 255.F), 1, std::max<long long>(duration.count(), 1));
+}
+
+static LocalTime toLocal(SysTime time) {
+    return std::chrono::current_zone()->to_local(time);
+}
+
+static LocalTime localNow() {
+    return toLocal(std::chrono::system_clock::now());
+}
+
+// DST makes a local time missing or repeated. Take its first occurrence that is not before notBefore,
+// so a wake inside the repeated hour does not land in the past.
+static SysTime toSys(LocalTime time, SysTime notBefore) {
+    const auto zone     = std::chrono::current_zone();
+    const auto earliest = zone->to_sys(time, std::chrono::choose::earliest);
+    return earliest >= notBefore ? earliest : zone->to_sys(time, std::chrono::choose::latest);
+}
+
+// Start of the occurrence of the profile that is in effect at now.
+static SysTime profileStart(const SSunsetProfile& profile, SysTime now) {
+    const auto localNow = toLocal(now);
+    LocalTime  start    = std::chrono::floor<std::chrono::days>(localNow) + profile.time.hour + profile.time.minute;
+    if (start > localNow)
+        start -= std::chrono::days(1);
+    return std::chrono::current_zone()->to_sys(start, std::chrono::choose::earliest);
+}
+
+struct STransitionStep {
+    STransition transition;
+    SysTime     nextStep;
+};
+
+// The transition into profiles[current] at now, if it is still running. Measured in system
+// time, so a fade across a DST change keeps its real duration.
+static std::optional<STransitionStep> transitionAt(const std::vector<SSunsetProfile>& profiles, size_t current, SysTime now) {
+    const auto& profile = profiles[current];
+    if (profiles.size() < 2 || profile.transition <= std::chrono::minutes::zero())
+        return std::nullopt;
+
+    const auto start   = profileStart(profile, now);
+    const auto elapsed = now - start;
+    if (elapsed >= profile.transition)
+        return std::nullopt;
+
+    const auto& previous = profiles[current == 0 ? profiles.size() - 1 : current - 1];
+    const auto  from     = matrixFor(previous);
+    const auto  steps    = transitionSteps(from, matrixFor(profile), profile.transition);
+    const auto  duration = std::chrono::duration<double>(profile.transition);
+    const auto  step     = static_cast<long long>(std::chrono::duration<double>(elapsed) / duration * steps);
+
+    return STransitionStep{
+        .transition = {.from = from, .progress = static_cast<float>(step) / steps},
+        .nextStep   = start + std::chrono::ceil<std::chrono::seconds>(duration * (step + 1) / steps),
+    };
+}
+
 void SOutput::applyCTM(struct SState* state) {
     if (!state->pCTMMgr)
         return;
@@ -98,14 +184,18 @@ int CHyprsunset::calculateMatrix() {
         return 0;
     }
 
+    if (m_transition) {
+        state.ctm = blend(m_transition->from, matrixFor(KELVIN, GAMMA, identity), m_transition->progress);
+        Debug::log(TRACE, "┣ Transition at {:.0f}%, CTM {}", m_transition->progress * 100, state.ctm.toString());
+        return 1;
+    }
+
     if (!identity)
         Debug::log(NONE, "┣ Setting the temperature to {}K{}\n┃", KELVIN, kelvinSet ? "" : " (default)");
     else
         Debug::log(NONE, "┣ Resetting the matrix (--identity passed)\n┃", KELVIN, kelvinSet ? "" : " (default)");
 
-    // calculate the matrix
-    state.ctm = identity ? Mat3x3::identity() : matrixForKelvin(KELVIN);
-    state.ctm.multiply(std::array<float, 9>{GAMMA, 0, 0, 0, GAMMA, 0, 0, 0, GAMMA});
+    state.ctm = matrixFor(KELVIN, GAMMA, identity);
 
     Debug::log(NONE, "┣ Calculated the CTM to be {}\n┃", state.ctm.toString());
 
@@ -350,27 +440,59 @@ void CHyprsunset::loadCurrentProfile() {
             return a.time.minute < b.time.minute;
     });
 
-    int current = g_pHyprsunset->currentProfile();
+    // A transition has to finish before the next profile starts.
+    for (size_t i = 0; i < profiles.size(); ++i) {
+        auto&       profile = profiles[i];
+        const auto& next    = profiles[(i + 1) % profiles.size()];
+        auto        gap     = (next.time.hour + next.time.minute) - (profile.time.hour + profile.time.minute);
+        if (gap <= std::chrono::minutes::zero())
+            gap += std::chrono::days(1);
+
+        if (profile.transition > gap) {
+            Debug::log(WARN, "Transition of profile {}:{} is longer than the {} minutes until the next profile, shortening it", profile.time.hour.count(),
+                       profile.time.minute.count(), gap.count());
+            profile.transition = gap;
+        }
+    }
+
+    const int current = currentProfile(localNow());
 
     if (current == -1)
         return;
 
-    SSunsetProfile profile = g_pHyprsunset->profiles[current];
-    KELVIN                 = profile.temperature;
-    GAMMA                  = profile.gamma;
-    ONSWITCH               = profile.onSwitch;
-    identity               = profile.identity;
+    const auto& profile = profiles[current];
+    applyProfile(profile);
+    resumeTransition();
 
     Debug::log(NONE, "┣ Applying profile from: {}:{}", profile.time.hour.count(), profile.time.minute.count());
 }
 
-int CHyprsunset::currentProfile() {
+void CHyprsunset::resumeTransition() {
+    m_transitionPaused = false;
+
+    const auto now     = std::chrono::system_clock::now();
+    const int  current = currentProfile(toLocal(now));
+    const auto step    = current == -1 ? std::nullopt : transitionAt(profiles, current, now);
+    m_transition       = step ? std::optional(step->transition) : std::nullopt;
+}
+
+void CHyprsunset::applyProfile(const SSunsetProfile& profile) {
+    KELVIN   = profile.temperature;
+    GAMMA    = profile.gamma;
+    ONSWITCH = profile.onSwitch;
+    identity = profile.identity;
+}
+
+void CHyprsunset::pauseTransition() {
+    m_transition.reset();
+    m_transitionPaused = true;
+}
+
+int CHyprsunset::currentProfile(LocalTime now) {
     if (profiles.empty())
         return -1;
     else if (profiles.size() == 1)
         return 0;
-
-    auto now = std::chrono::zoned_time(std::chrono::current_zone(), std::chrono::system_clock::now()).get_local_time();
 
     for (size_t i = 0; i < profiles.size(); ++i) {
         const auto& p = profiles[i];
@@ -388,7 +510,7 @@ int CHyprsunset::currentProfile() {
 }
 
 std::optional<SSunsetProfile> CHyprsunset::getCurrentProfile() {
-    int current = currentProfile();
+    int current = currentProfile(localNow());
     if (current < 0)
         return std::nullopt;
 
@@ -457,46 +579,75 @@ static bool waitUntilRealtime(int stopFd, const std::atomic<bool>& terminate, ti
 
 void CHyprsunset::schedule() {
     m_scheduleThread = std::thread([this] {
+        // profiles is rebuilt by an IPC reset on the main thread, so it is only read under loopRequestMutex.
+        int last = -1;
+        {
+            std::lock_guard<std::mutex> lg(m_sEventLoopInternals.loopRequestMutex);
+            last = currentProfile(localNow());
+        }
+
         while (!m_bTerminate.load()) {
-            int current = currentProfile();
-            if (current == -1)
-                break;
+            SysTime wake;
+            // A wake at a profile's time applies it and runs on-switch, even if it is the same profile.
+            bool forProfile = false;
+            {
+                std::lock_guard<std::mutex> lg(m_sEventLoopInternals.loopRequestMutex);
+                const auto                  now     = std::chrono::system_clock::now();
+                const int                   current = currentProfile(toLocal(now));
+                if (current == -1)
+                    break;
 
-            SSunsetProfile nextProfile = (size_t)current == profiles.size() - 1 ? profiles[0] : profiles[current + 1];
+                // Wake for the next transition step, or else for the next profile. Steps keep
+                // waking while a manual change pauses the transition, so a reset can resume it.
+                if (const auto step = transitionAt(profiles, current, now); step)
+                    wake = step->nextStep;
+                else {
+                    const auto& next     = profiles[(current + 1) % profiles.size()];
+                    const auto  localNow = toLocal(now);
+                    LocalTime   local    = std::chrono::floor<std::chrono::days>(localNow) + next.time.hour + next.time.minute;
+                    if (localNow >= local)
+                        local += std::chrono::days(1);
+                    wake       = toSys(local, now);
+                    forProfile = true;
+                }
+            }
 
-            auto           now  = std::chrono::zoned_time(std::chrono::current_zone(), std::chrono::system_clock::now()).get_local_time();
-            auto           time = std::chrono::floor<std::chrono::days>(now) + nextProfile.time.hour + nextProfile.time.minute;
-
-            if (now >= time)
-                time += std::chrono::days(1);
-
-            auto     systemTime = std::chrono::zoned_time{std::chrono::current_zone(), time}.get_sys_time();
-            auto     seconds    = std::chrono::duration_cast<std::chrono::seconds>(systemTime.time_since_epoch());
-            timespec deadline   = {.tv_sec = static_cast<time_t>(seconds.count()), .tv_nsec = 0};
+            const auto seconds  = std::chrono::ceil<std::chrono::seconds>(wake.time_since_epoch());
+            timespec   deadline = {.tv_sec = static_cast<time_t>(seconds.count()), .tv_nsec = 0};
 
             if (!waitUntilRealtime(m_stopFd, m_bTerminate, deadline) || m_bTerminate.load())
                 break;
-
-            int newcurrent = currentProfile();
-            if (newcurrent == -1 || m_bTerminate.load())
-                break;
-
-            SSunsetProfile              newProfile = profiles[newcurrent];
 
             std::lock_guard<std::mutex> lg(m_sEventLoopInternals.loopRequestMutex);
             if (m_bTerminate.load())
                 break;
 
-            KELVIN   = newProfile.temperature;
-            GAMMA    = newProfile.gamma;
-            ONSWITCH = newProfile.onSwitch;
-            identity = newProfile.identity;
+            const auto now        = std::chrono::system_clock::now();
+            const int  newcurrent = currentProfile(toLocal(now));
+            if (newcurrent == -1)
+                break;
 
-            Debug::log(NONE, "┣ Switched to new profile from: {}:{}", newProfile.time.hour.count(), newProfile.time.minute.count());
+            const bool switched = forProfile || newcurrent != last;
+
+            // A manual change holds until the next profile.
+            if (!switched && m_transitionPaused)
+                continue;
+
+            if (switched) {
+                const auto& newProfile = profiles[newcurrent];
+                last                   = newcurrent;
+                applyProfile(newProfile);
+                m_transitionPaused                = false;
+                m_sEventLoopInternals.runOnSwitch = true;
+                Debug::log(NONE, "┣ Switched to new profile from: {}:{}{}", newProfile.time.hour.count(), newProfile.time.minute.count(),
+                           newProfile.transition.count() > 0 ? std::format(", fading in over {} minutes", newProfile.transition.count()) : "");
+            }
+
+            const auto step = transitionAt(profiles, newcurrent, now);
+            m_transition    = step ? std::optional(step->transition) : std::nullopt;
 
             m_sEventLoopInternals.shouldProcess = true;
             m_sEventLoopInternals.isScheduled   = true;
-            m_sEventLoopInternals.runOnSwitch   = true;
             m_sEventLoopInternals.loopSignal.notify_all();
         }
     });

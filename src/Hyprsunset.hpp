@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <sys/signal.h>
 #include <thread>
@@ -17,6 +18,9 @@ using namespace Hyprutils::Memory;
 #define UP CUniquePointer
 #define SP CSharedPointer
 #define WP CWeakPointer
+
+using LocalTime = std::chrono::local_time<std::chrono::system_clock::duration>;
+using SysTime   = std::chrono::system_clock::time_point;
 
 struct SOutput {
     SP<CCWlOutput> output;
@@ -44,6 +48,14 @@ struct SSunsetProfile {
     float         gamma       = 1.0f;
     bool          identity    = false;
     std::string   onSwitch    = "";
+    // Fade in from the previous profile over this long, starting at time.
+    std::chrono::minutes transition{0};
+};
+
+// A profile transition in progress. The CTM blends from `from` to the current profile's matrix.
+struct STransition {
+    Mat3x3 from;
+    float  progress = 0.F;
 };
 
 class CHyprsunset {
@@ -63,12 +75,19 @@ class CHyprsunset {
     CHyprsunset();
     ~CHyprsunset();
 
+    // Both guarded by m_sEventLoopInternals.loopRequestMutex once the event loop runs.
+    std::optional<STransition> m_transition;
+    // Set by manual changes (IPC, CLI flags). Holds off transitions until the next profile or a reset.
+    bool                          m_transitionPaused = false;
+
     int                           calculateMatrix();
     int                           init();
     void                          tick();
     void                          loadCurrentProfile();
     std::optional<SSunsetProfile> getCurrentProfile();
     void                          scheduleOnSwitch();
+    void                          pauseTransition();
+    void                          resumeTransition();
     void                          terminate();
     // Async-signal-safe. Wakes the schedule and IPC threads blocked in poll.
     void signalStop();
@@ -88,7 +107,8 @@ class CHyprsunset {
     void        reload();
     void        schedule();
     void        onSwitch();
-    int         currentProfile();
+    int         currentProfile(LocalTime now);
+    void        applyProfile(const SSunsetProfile& profile);
     void        startEventLoop();
     // Join workers before dropping the CTM manager or returning from main.
     // Otherwise a detached thread calls current_zone() or reload() while
