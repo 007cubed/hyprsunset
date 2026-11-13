@@ -467,6 +467,21 @@ void CHyprsunset::loadCurrentProfile() {
     Debug::log(NONE, "┣ Applying profile from: {}:{}", profile.time.hour.count(), profile.time.minute.count());
 }
 
+void CHyprsunset::setSchedule(bool enabled) {
+    m_scheduleEnabled = enabled;
+
+    if (!enabled) {
+        m_transition.reset();
+        return;
+    }
+
+    // Back on: apply what the schedule says now, mid-fade included.
+    if (const int current = currentProfile(localNow()); current != -1) {
+        applyProfile(profiles[current]);
+        resumeTransition();
+    }
+}
+
 void CHyprsunset::resumeTransition() {
     m_transitionPaused = false;
 
@@ -538,8 +553,8 @@ std::string CHyprsunset::statusJson() {
         }
     }
 
-    return std::format(R"({{"temperature":{},"identity":{},"gamma":{:.0f},"paused":{},"fade":{},"profile":{},"next":{}}})", KELVIN, identity, GAMMA * 100, m_transitionPaused, fade,
-                       profile, next);
+    return std::format(R"({{"temperature":{},"identity":{},"gamma":{:.0f},"schedule":{},"paused":{},"fade":{},"profile":{},"next":{}}})", KELVIN, identity, GAMMA * 100,
+                       m_scheduleEnabled, m_transitionPaused, fade, profile, next);
 }
 
 // Relative sleeps pause during suspend. An absolute CLOCK_REALTIME timer is
@@ -653,6 +668,13 @@ void CHyprsunset::schedule() {
                 break;
 
             const bool switched = forProfile || newcurrent != last;
+
+            // With the schedule off nothing is applied, but the profile is tracked, so
+            // turning it back on does not count as a switch.
+            if (!m_scheduleEnabled) {
+                last = newProfile.id;
+                continue;
+            }
 
             // A manual change holds until the next profile.
             if (!switched && m_transitionPaused)
