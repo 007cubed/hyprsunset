@@ -84,7 +84,9 @@ class CHyprsunset {
     // Both guarded by m_sEventLoopInternals.loopRequestMutex once the event loop runs.
     std::optional<STransition> m_transition;
     // Set by manual changes (IPC, CLI flags). Holds off transitions until the next profile or a reset.
-    bool                          m_transitionPaused = false;
+    bool m_transitionPaused = false;
+    // Off: profiles no longer switch or fade; the values stay wherever they are set. Not saved.
+    bool                          m_scheduleEnabled = true;
 
     int                           calculateMatrix();
     int                           init();
@@ -96,6 +98,7 @@ class CHyprsunset {
     void        scheduleOnSwitch();
     void        pauseTransition();
     void        resumeTransition();
+    void        setSchedule(bool enabled);
     void        terminate();
     // Async-signal-safe. Wakes the schedule and IPC threads blocked in poll.
     void signalStop();

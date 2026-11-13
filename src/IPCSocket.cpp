@@ -330,6 +330,21 @@ bool CIPCSocket::mainThreadParseRequest() {
         return false;
     }
 
+    // schedule [on|off]: switch the profile schedule on or off, or print whether it is on.
+    if (copy == "schedule" || copy.starts_with("schedule ")) {
+        const auto args = copy == "schedule" ? std::string{} : copy.substr(9);
+        if (args.empty()) {
+            m_szReply = g_pHyprsunset->m_scheduleEnabled ? "on" : "off";
+            return false;
+        }
+        if (args != "on" && args != "off") {
+            m_szReply = "Invalid schedule value (should be on or off)";
+            return false;
+        }
+        g_pHyprsunset->setSchedule(args == "on");
+        return true;
+    }
+
     // Before "profile": unlike it, this runs no on-switch command, so it is safe to poll.
     if (copy == "status") {
         m_szReply = g_pHyprsunset->statusJson();
