@@ -458,34 +458,41 @@ static bool waitUntilRealtime(int stopFd, const std::atomic<bool>& terminate, ti
 void CHyprsunset::schedule() {
     m_scheduleThread = std::thread([this] {
         while (!m_bTerminate.load()) {
-            int current = currentProfile();
-            if (current == -1)
-                break;
+            timespec deadline = {.tv_sec = 0, .tv_nsec = 0};
+            {
+                // An IPC reset rebuilds profiles, so they are only read under loopRequestMutex.
+                std::lock_guard<std::mutex> lg(m_sEventLoopInternals.loopRequestMutex);
+                int                         current = currentProfile();
+                if (current == -1)
+                    break;
 
-            SSunsetProfile nextProfile = (size_t)current == profiles.size() - 1 ? profiles[0] : profiles[current + 1];
+                const auto& nextProfile = (size_t)current == profiles.size() - 1 ? profiles[0] : profiles[current + 1];
 
-            auto           now  = std::chrono::zoned_time(std::chrono::current_zone(), std::chrono::system_clock::now()).get_local_time();
-            auto           time = std::chrono::floor<std::chrono::days>(now) + nextProfile.time.hour + nextProfile.time.minute;
+                auto        now  = std::chrono::zoned_time(std::chrono::current_zone(), std::chrono::system_clock::now()).get_local_time();
+                auto        time = std::chrono::floor<std::chrono::days>(now) + nextProfile.time.hour + nextProfile.time.minute;
 
-            if (now >= time)
-                time += std::chrono::days(1);
+                if (now >= time)
+                    time += std::chrono::days(1);
 
-            auto     systemTime = std::chrono::zoned_time{std::chrono::current_zone(), time}.get_sys_time();
-            auto     seconds    = std::chrono::duration_cast<std::chrono::seconds>(systemTime.time_since_epoch());
-            timespec deadline   = {.tv_sec = static_cast<time_t>(seconds.count()), .tv_nsec = 0};
+                // A local time in the hour skipped or repeated by a DST change has no single instant;
+                // take the earliest instead of throwing.
+                auto systemTime = std::chrono::current_zone()->to_sys(time, std::chrono::choose::earliest);
+                auto seconds    = std::chrono::duration_cast<std::chrono::seconds>(systemTime.time_since_epoch());
+                deadline        = {.tv_sec = static_cast<time_t>(seconds.count()), .tv_nsec = 0};
+            }
 
             if (!waitUntilRealtime(m_stopFd, m_bTerminate, deadline) || m_bTerminate.load())
                 break;
 
-            int newcurrent = currentProfile();
-            if (newcurrent == -1 || m_bTerminate.load())
-                break;
-
-            SSunsetProfile              newProfile = profiles[newcurrent];
-
             std::lock_guard<std::mutex> lg(m_sEventLoopInternals.loopRequestMutex);
             if (m_bTerminate.load())
                 break;
+
+            int newcurrent = currentProfile();
+            if (newcurrent == -1)
+                break;
+
+            const auto& newProfile = profiles[newcurrent];
 
             KELVIN   = newProfile.temperature;
             GAMMA    = newProfile.gamma;
