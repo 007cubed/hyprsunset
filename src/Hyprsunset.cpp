@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client-core.h>
+#include <hyprutils/memory/Casts.hpp>
 #include <hyprutils/os/Process.hpp>
 
 #define TIMESPEC_NSEC_PER_SEC 1000000000L
@@ -348,6 +349,7 @@ void CHyprsunset::buildProfiles() {
         sunTimes            = NSun::calculate(std::chrono::sys_days{today.time_since_epoch()} + std::chrono::days(std::lround(apart)), m_location->latitude, m_location->longitude);
     }
 
+    m_profilesDay = today;
     profiles.clear();
     for (auto profile : m_configProfiles) {
         if (profile.sun != SUN_NONE) {
@@ -382,10 +384,18 @@ void CHyprsunset::buildProfiles() {
     });
 }
 
+static bool hasSunProfile(const std::vector<SSunsetProfile>& profiles) {
+    return std::ranges::any_of(profiles, [](const auto& p) { return p.sun != SUN_NONE; });
+}
+
+bool CHyprsunset::followsSun() const {
+    return m_location && hasSunProfile(m_configProfiles);
+}
+
 void CHyprsunset::loadCurrentProfile() {
     m_configProfiles = g_pConfigManager->getSunsetProfiles();
     MAX_GAMMA        = g_pConfigManager->getMaxGamma();
-    m_location       = std::ranges::any_of(m_configProfiles, [](const auto& p) { return p.sun != SUN_NONE; }) ? g_pConfigManager->getLocation() : std::nullopt;
+    m_location       = hasSunProfile(m_configProfiles) ? g_pConfigManager->getLocation() : std::nullopt;
 
     buildProfiles();
 
@@ -496,32 +506,60 @@ static bool waitUntilRealtime(int stopFd, const std::atomic<bool>& terminate, ti
     return reached;
 }
 
+// The same settings, and the same time unless it follows the sun.
+static bool sameProfile(const SSunsetProfile& a, const SSunsetProfile& b) {
+    const bool sameTime = a.sun != SUN_NONE || (a.time.hour == b.time.hour && a.time.minute == b.time.minute);
+    return a.sun == b.sun && sameTime && a.temperature == b.temperature && a.gamma == b.gamma && a.identity == b.identity && a.onSwitch == b.onSwitch;
+}
+
 void CHyprsunset::schedule() {
     m_scheduleThread = std::thread([this] {
+        std::optional<SSunsetProfile> applied;
+        {
+            std::lock_guard<std::mutex> lg(m_sEventLoopInternals.loopRequestMutex);
+            if (const int current = currentProfile(); current != -1)
+                applied = profiles[current];
+        }
+
         while (!m_bTerminate.load()) {
-            timespec deadline = {.tv_sec = 0, .tv_nsec = 0};
+            std::chrono::sys_seconds wakeAt;
+            bool                     forProfile = false;
             {
                 // An IPC reset rebuilds profiles, so they are only read under loopRequestMutex.
                 std::lock_guard<std::mutex> lg(m_sEventLoopInternals.loopRequestMutex);
-                int                         current = currentProfile();
-                if (current == -1)
+                const auto                  zone    = std::chrono::current_zone();
+                const auto                  now     = zone->to_local(std::chrono::system_clock::now());
+                const int                   current = currentProfile();
+                if (current == -1 && !followsSun())
                     break;
 
-                const auto& nextProfile = (size_t)current == profiles.size() - 1 ? profiles[0] : profiles[current + 1];
+                std::optional<std::chrono::local_time<std::chrono::system_clock::duration>> wake;
+                if (current != -1) {
+                    const auto& nextProfile = sc<size_t>(current) == profiles.size() - 1 ? profiles[0] : profiles[current + 1];
+                    auto        time        = std::chrono::floor<std::chrono::days>(now) + nextProfile.time.hour + nextProfile.time.minute;
 
-                auto        now  = std::chrono::zoned_time(std::chrono::current_zone(), std::chrono::system_clock::now()).get_local_time();
-                auto        time = std::chrono::floor<std::chrono::days>(now) + nextProfile.time.hour + nextProfile.time.minute;
+                    if (now >= time)
+                        time += std::chrono::days(1);
 
-                if (now >= time)
-                    time += std::chrono::days(1);
+                    wake       = time;
+                    forProfile = true;
+                }
+
+                // Sun times move every day: also wake at local midnight to work them out again.
+                if (followsSun()) {
+                    const auto midnight = std::chrono::floor<std::chrono::days>(now) + std::chrono::days(1);
+                    if (!wake || midnight < *wake) {
+                        wake       = midnight;
+                        forProfile = false;
+                    }
+                }
 
                 // A local time in the hour skipped or repeated by a DST change has no single instant;
                 // take the earliest instead of throwing.
-                auto systemTime = std::chrono::current_zone()->to_sys(time, std::chrono::choose::earliest);
-                auto seconds    = std::chrono::duration_cast<std::chrono::seconds>(systemTime.time_since_epoch());
-                deadline        = {.tv_sec = static_cast<time_t>(seconds.count()), .tv_nsec = 0};
+                wakeAt = std::chrono::ceil<std::chrono::seconds>(zone->to_sys(*wake, std::chrono::choose::earliest));
             }
 
+            const timespec deadline = {.tv_sec = sc<time_t>(wakeAt.time_since_epoch().count()), .tv_nsec = 0};
             if (!waitUntilRealtime(m_stopFd, m_bTerminate, deadline) || m_bTerminate.load())
                 break;
 
@@ -529,12 +567,25 @@ void CHyprsunset::schedule() {
             if (m_bTerminate.load())
                 break;
 
-            int newcurrent = currentProfile();
+            const auto now = std::chrono::system_clock::now();
+            if (followsSun() && std::chrono::floor<std::chrono::days>(std::chrono::current_zone()->to_local(now)) != m_profilesDay) {
+                buildProfiles();
+                Debug::log(NONE, "┣ Worked out sunrise and sunset for a new day");
+            }
+
+            // A midnight wake only rebuilds, unless it is late: a suspend may have slept through a profile time.
+            if (!forProfile && now - wakeAt < std::chrono::minutes(1))
+                continue;
+
+            const int newcurrent = currentProfile();
             if (newcurrent == -1)
-                break;
+                continue;
 
             const auto& newProfile = profiles[newcurrent];
+            if (!forProfile && applied && sameProfile(*applied, newProfile))
+                continue;
 
+            applied  = newProfile;
             KELVIN   = newProfile.temperature;
             GAMMA    = newProfile.gamma;
             ONSWITCH = newProfile.onSwitch;

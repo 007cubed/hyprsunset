@@ -61,7 +61,7 @@ pkg_check_modules(
   IMPORTED_TARGET
   wayland-client
   wayland-protocols
-  hyprutils>=0.2.3
+  hyprutils>=0.8.3
   hyprlang
   hyprwayland-scanner>=0.4.0)
 

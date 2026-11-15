@@ -113,12 +113,15 @@ class CHyprsunset {
     void shutdownWorkers();
 
     // Fills profiles from m_configProfiles with today's sun times. Under loopRequestMutex.
-    void                        buildProfiles();
+    void buildProfiles();
+    // Has a sun profile and a location.
+    bool                        followsSun() const;
 
     std::thread                 m_scheduleThread;
     std::vector<SSunsetProfile> profiles;
     std::vector<SSunsetProfile> m_configProfiles;
     std::optional<SLocation>    m_location;
+    std::chrono::local_days     m_profilesDay{};
 };
 
 // Cleared at the start of ~CHyprsunset. See g_ipcSocketAlive.
