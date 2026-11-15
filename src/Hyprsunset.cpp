@@ -425,11 +425,10 @@ void CHyprsunset::onSwitch() {
     Debug::log(LOG, "Process Created with pid {}", proc.pid());
 }
 
-void CHyprsunset::loadCurrentProfile() {
-    profiles  = g_pConfigManager->getSunsetProfiles();
-    MAX_GAMMA = g_pConfigManager->getMaxGamma();
-
-    Debug::log(NONE, "┣ Loaded {} profiles", profiles.size());
+void CHyprsunset::buildProfiles() {
+    // Taken before reading, so a build that straddles midnight is simply redone at the next wake.
+    m_profilesDay = std::chrono::floor<std::chrono::days>(localNow());
+    profiles      = g_pConfigManager->getSunsetProfiles();
 
     std::sort(profiles.begin(), profiles.end(), [](const auto& a, const auto& b) {
         if (a.time.hour < b.time.hour)
@@ -454,6 +453,17 @@ void CHyprsunset::loadCurrentProfile() {
             profile.transition = gap;
         }
     }
+}
+
+bool CHyprsunset::followsSun() const {
+    return std::ranges::any_of(profiles, [](const auto& profile) { return !profile.sun.empty(); });
+}
+
+void CHyprsunset::loadCurrentProfile() {
+    buildProfiles();
+    MAX_GAMMA = g_pConfigManager->getMaxGamma();
+
+    Debug::log(NONE, "┣ Loaded {} profiles", profiles.size());
 
     const int current = currentProfile(localNow());
 
@@ -650,6 +660,15 @@ void CHyprsunset::schedule() {
                     wake       = toSys(local, now);
                     forProfile = true;
                 }
+
+                // Sunrise and sunset move every day: wake at local midnight to work them out again.
+                if (followsSun()) {
+                    const auto midnight = toSys(std::chrono::floor<std::chrono::days>(toLocal(now)) + std::chrono::days(1), now);
+                    if (midnight < wake) {
+                        wake       = midnight;
+                        forProfile = false;
+                    }
+                }
             }
 
             const auto seconds  = std::chrono::ceil<std::chrono::seconds>(wake.time_since_epoch());
@@ -662,8 +681,14 @@ void CHyprsunset::schedule() {
             if (m_bTerminate.load())
                 break;
 
-            const auto now        = std::chrono::system_clock::now();
-            const int  newcurrent = currentProfile(toLocal(now));
+            const auto now = std::chrono::system_clock::now();
+            // A new day, at midnight or on waking from a suspend that crossed it: today's sun times.
+            if (followsSun() && std::chrono::floor<std::chrono::days>(toLocal(now)) != m_profilesDay) {
+                buildProfiles();
+                Debug::log(NONE, "┣ Worked out sunrise and sunset for a new day");
+            }
+
+            const int newcurrent = currentProfile(toLocal(now));
             if (newcurrent == -1)
                 break;
 

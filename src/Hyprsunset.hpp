@@ -117,6 +117,9 @@ class CHyprsunset {
     int         currentProfile(LocalTime now);
     void        applyProfile(const SSunsetProfile& profile);
     void        startEventLoop();
+    // Reads the profiles, with sunrise and sunset worked out for today, without applying any.
+    void        buildProfiles();
+    bool        followsSun() const;
     // Join workers before dropping the CTM manager or returning from main.
     // Otherwise a detached thread calls current_zone() or reload() while
     // those objects are being destroyed.
@@ -124,6 +127,8 @@ class CHyprsunset {
 
     std::thread                 m_scheduleThread;
     std::vector<SSunsetProfile> profiles;
+    // The local day the sun times in profiles were worked out for.
+    std::chrono::local_days m_profilesDay{};
 };
 
 // Cleared at the start of ~CHyprsunset. See g_ipcSocketAlive.
