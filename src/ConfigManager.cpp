@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <hyprlang.hpp>
 #include <hyprutils/path/Path.hpp>
+#include <cmath>
 #include <string>
 #include <sys/ucontext.h>
 #include "helpers/Log.hpp"
@@ -19,6 +20,8 @@ CConfigManager::CConfigManager(std::string configPath) :
 
 void CConfigManager::init() {
     m_config.addConfigValue("max-gamma", Hyprlang::INT{100});
+    m_config.addConfigValue("latitude", Hyprlang::FLOAT{0});
+    m_config.addConfigValue("longitude", Hyprlang::FLOAT{0});
 
     m_config.addSpecialCategory("profile", Hyprlang::SSpecialCategoryOptions{.key = nullptr, .anonymousKeyBased = true});
     m_config.addSpecialConfigValue("profile", "time", Hyprlang::STRING{"00:00"});
@@ -60,6 +63,17 @@ std::vector<SSunsetProfile> CConfigManager::getSunsetProfiles() {
             RASSERT(false, "Missing property for Profile: {}", e.what()); //
         }
 
+        const eSunEvent sun = time == "sunrise" ? SUN_RISE : time == "sunset" ? SUN_SET : SUN_NONE;
+        if (sun != SUN_NONE) {
+            result.push_back(SSunsetProfile{.time        = {.hour = std::chrono::hours(0), .minute = std::chrono::minutes(0)},
+                                            .temperature = temperature,
+                                            .gamma       = gamma,
+                                            .identity    = identity,
+                                            .onSwitch    = onSwitch,
+                                            .sun         = sun});
+            continue;
+        }
+
         size_t separator = time.find(':');
 
         if (separator == std::string::npos) {
@@ -91,6 +105,26 @@ std::vector<SSunsetProfile> CConfigManager::getSunsetProfiles() {
     }
 
     return result;
+}
+
+std::optional<SLocation> CConfigManager::getLocation() {
+    const auto latitude  = m_config.getConfigValuePtr("latitude");
+    const auto longitude = m_config.getConfigValuePtr("longitude");
+
+    if (!latitude->m_bSetByUser || !longitude->m_bSetByUser) {
+        Debug::log(ERR, "Sunrise and sunset profiles need latitude and longitude");
+        return std::nullopt;
+    }
+
+    const double lat = std::any_cast<Hyprlang::FLOAT>(latitude->getValue());
+    const double lon = std::any_cast<Hyprlang::FLOAT>(longitude->getValue());
+    // Written so that nan fails too.
+    if (!(std::abs(lat) <= 90) || !(std::abs(lon) <= 180)) {
+        Debug::log(ERR, "Invalid location {:.2f}, {:.2f}: latitude must be within ±90 and longitude within ±180", lat, lon);
+        return std::nullopt;
+    }
+
+    return SLocation{.latitude = lat, .longitude = lon};
 }
 
 float CConfigManager::getMaxGamma() {

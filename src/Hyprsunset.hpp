@@ -1,5 +1,9 @@
+#pragma once
+
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <sys/signal.h>
 #include <thread>
 #include <wayland-client.h>
@@ -34,16 +38,29 @@ struct SState {
     int                               timerFD = -1;
 };
 
+enum eSunEvent : uint8_t {
+    SUN_NONE = 0,
+    SUN_RISE,
+    SUN_SET,
+};
+
 struct SSunsetProfile {
     struct {
-        std::chrono::hours   hour;
-        std::chrono::minutes minute;
+        std::chrono::hours   hour{0};
+        std::chrono::minutes minute{0};
     } time;
 
     unsigned long temperature = 6000;
     float         gamma       = 1.0f;
     bool          identity    = false;
     std::string   onSwitch    = "";
+    // Not SUN_NONE: time is worked out for each day from the location.
+    eSunEvent sun = SUN_NONE;
+};
+
+struct SLocation {
+    double latitude  = 0;
+    double longitude = 0;
 };
 
 class CHyprsunset {
@@ -93,10 +110,15 @@ class CHyprsunset {
     // Join workers before dropping the CTM manager or returning from main.
     // Otherwise a detached thread calls current_zone() or reload() while
     // those objects are being destroyed.
-    void                        shutdownWorkers();
+    void shutdownWorkers();
+
+    // Fills profiles from m_configProfiles with today's sun times. Under loopRequestMutex.
+    void                        buildProfiles();
 
     std::thread                 m_scheduleThread;
     std::vector<SSunsetProfile> profiles;
+    std::vector<SSunsetProfile> m_configProfiles;
+    std::optional<SLocation>    m_location;
 };
 
 // Cleared at the start of ~CHyprsunset. See g_ipcSocketAlive.

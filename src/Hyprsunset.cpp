@@ -1,6 +1,7 @@
 #include "ConfigManager.hpp"
 #include "helpers/Log.hpp"
 #include "IPCSocket.hpp"
+#include "helpers/SunTimes.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -335,13 +336,43 @@ void CHyprsunset::onSwitch() {
     Debug::log(LOG, "Process Created with pid {}", proc.pid());
 }
 
-void CHyprsunset::loadCurrentProfile() {
-    profiles  = g_pConfigManager->getSunsetProfiles();
-    MAX_GAMMA = g_pConfigManager->getMaxGamma();
+void CHyprsunset::buildProfiles() {
+    const auto                     zone  = std::chrono::current_zone();
+    const auto                     today = std::chrono::floor<std::chrono::days>(zone->to_local(std::chrono::system_clock::now()));
 
-    Debug::log(NONE, "┣ Loaded {} profiles", profiles.size());
+    std::optional<NSun::SSunTimes> sunTimes;
+    if (m_location) {
+        // Where the zone is more than 12 h from solar time (e.g. Samoa), today's solar noon is on the neighbouring UTC date.
+        const auto   offset = zone->get_info(zone->to_sys(today + std::chrono::hours(12), std::chrono::choose::earliest)).offset;
+        const double apart  = (m_location->longitude / 15.0 - std::chrono::duration<double, std::ratio<3600>>(offset).count()) / 24.0;
+        sunTimes            = NSun::calculate(std::chrono::sys_days{today.time_since_epoch()} + std::chrono::days(std::lround(apart)), m_location->latitude, m_location->longitude);
+    }
 
-    std::sort(profiles.begin(), profiles.end(), [](const auto& a, const auto& b) {
+    profiles.clear();
+    for (auto profile : m_configProfiles) {
+        if (profile.sun != SUN_NONE) {
+            const std::string_view name = profile.sun == SUN_RISE ? "sunrise" : "sunset";
+            if (!sunTimes) {
+                Debug::log(ERR, "Skipping the {} profile: no location", name);
+                continue;
+            }
+
+            const auto event = profile.sun == SUN_RISE ? sunTimes->sunrise : sunTimes->sunset;
+            if (!event) {
+                Debug::log(WARN, "No {} today at latitude {:.2f}, skipping that profile", name, m_location->latitude);
+                continue;
+            }
+
+            const auto local = std::chrono::floor<std::chrono::minutes>(zone->to_local(*event));
+            const auto time  = std::chrono::hh_mm_ss{local - std::chrono::floor<std::chrono::days>(local)};
+            profile.time     = {.hour = time.hours(), .minute = time.minutes()};
+        }
+
+        profiles.push_back(profile);
+    }
+
+    // Stable, so profiles at the same minute keep their config order.
+    std::stable_sort(profiles.begin(), profiles.end(), [](const auto& a, const auto& b) {
         if (a.time.hour < b.time.hour)
             return true;
         else if (a.time.hour > b.time.hour)
@@ -349,6 +380,16 @@ void CHyprsunset::loadCurrentProfile() {
         else
             return a.time.minute < b.time.minute;
     });
+}
+
+void CHyprsunset::loadCurrentProfile() {
+    m_configProfiles = g_pConfigManager->getSunsetProfiles();
+    MAX_GAMMA        = g_pConfigManager->getMaxGamma();
+    m_location       = std::ranges::any_of(m_configProfiles, [](const auto& p) { return p.sun != SUN_NONE; }) ? g_pConfigManager->getLocation() : std::nullopt;
+
+    buildProfiles();
+
+    Debug::log(NONE, "┣ Loaded {} profiles", profiles.size());
 
     int current = g_pHyprsunset->currentProfile();
 
