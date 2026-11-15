@@ -50,6 +50,8 @@ struct SSunsetProfile {
     std::string   onSwitch    = "";
     // Fade in from the previous profile over this long, starting at time.
     std::chrono::minutes transition{0};
+    // The sun event a profile follows, as "sunrise+0" / "sunset+0"; empty for a clock time.
+    std::string sun = "";
 };
 
 // A profile transition in progress. The CTM blends from `from` to the current profile's matrix.

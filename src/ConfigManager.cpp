@@ -108,6 +108,8 @@ std::vector<SSunsetProfile> CConfigManager::getSunsetProfiles() {
         const bool wantsSunrise = time == "sunrise";
         const bool wantsSunset  = time == "sunset";
 
+        const std::string sun = wantsSunrise ? "sunrise+0" : wantsSunset ? "sunset+0" : "";
+
         if (wantsSunrise || wantsSunset) {
             const auto&  sunTimes    = ensureSunTimes(key, time);
             const double decimalHour = wantsSunrise ? sunTimes.sunrise : sunTimes.sunset;
@@ -160,6 +162,7 @@ std::vector<SSunsetProfile> CConfigManager::getSunsetProfiles() {
             .identity    = identity,
             .onSwitch    = onSwitch,
             .transition  = std::chrono::minutes(transition),
+            .sun         = sun,
         });
         // clang-format on
     }

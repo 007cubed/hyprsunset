@@ -533,7 +533,7 @@ std::optional<SSunsetProfile> CHyprsunset::getCurrentProfile() {
 }
 
 static std::string profileJson(const SSunsetProfile& profile) {
-    const auto sun = profile.sunEvent == NSun::EVENT_NONE ? std::string{} : std::format("{}{:+}", NSun::eventName(profile.sunEvent), profile.sunOffset.count());
+    const auto& sun = profile.sun;
     return std::format(R"({{"time":"{:0>2}:{:0>2}","sun":"{}","temperature":{},"identity":{},"gamma":{:.0f},"transition":{}}})", profile.time.hour.count(),
                        profile.time.minute.count(), sun, profile.temperature, profile.identity, profile.gamma * 100, profile.transition.count());
 }
@@ -672,7 +672,7 @@ void CHyprsunset::schedule() {
             // With the schedule off nothing is applied, but the profile is tracked, so
             // turning it back on does not count as a switch.
             if (!m_scheduleEnabled) {
-                last = newProfile.id;
+                last = newcurrent;
                 continue;
             }
 
